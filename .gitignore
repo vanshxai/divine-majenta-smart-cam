@@ -1,0 +1,20 @@
+# secrets -- never commit camera credentials
+.camera_user
+.camera_pw
+
+# sensitive/private data -- employee & visitor face photos + biometric embeddings.
+# Deliberately excluded by default; see conversation about whether to include these.
+events.db
+snapshots/
+known_faces/
+
+# pretrained model weights -- large binaries, fetched by setup instead of committed
+*.onnx
+*.pt
+
+# runtime / env noise
+server.log
+*.log
+__pycache__/
+*.pyc
+.DS_Store
