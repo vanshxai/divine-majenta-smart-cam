@@ -12,9 +12,21 @@ known_faces/
 *.onnx
 *.pt
 
+# per-machine config (holds this install's camera IP etc.); config.example.json IS committed
+config.json
+
+# ffmpeg binaries dropped in for packaging
+ffmpeg/
+
+# PyInstaller build output
+build/
+dist/
+*.manifest
+
 # runtime / env noise
 server.log
 *.log
 __pycache__/
 *.pyc
 .DS_Store
+venv/

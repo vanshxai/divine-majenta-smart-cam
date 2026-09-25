@@ -12,10 +12,12 @@ Run:  python3 app.py
 View: http://localhost:5055
 """
 import os
+import sys
 import cv2
 import json
 import time
 import uuid
+import shutil
 import socket
 import sqlite3
 import threading
@@ -25,17 +27,45 @@ from datetime import datetime
 from flask import Flask, Response, jsonify, request, send_from_directory
 
 # ---- config ---------------------------------------------------------------
-BASE = os.path.dirname(os.path.abspath(__file__))
-CAMERA_IP = "192.168.1.3"
+# When frozen by PyInstaller, data files (models) sit next to the executable /
+# in the unpacked bundle dir; otherwise next to this source file. resource_path
+# resolves either so the packaged Windows .exe finds yunet.onnx/sface.onnx/yolo.
+if getattr(sys, "frozen", False):
+    BASE = os.path.dirname(sys.executable)          # writable dir beside the .exe (db, snapshots, config)
+    BUNDLE = getattr(sys, "_MEIPASS", BASE)          # read-only unpacked bundle (models baked in at build)
+else:
+    BASE = os.path.dirname(os.path.abspath(__file__))
+    BUNDLE = BASE
 
-# The Mac's Wi-Fi (en0) and the direct-cabled camera adapter (en6) both happen to
-# use the 192.168.1.x range, which makes default routing to CAMERA_IP ambiguous --
-# it can silently go out Wi-Fi (where the camera no longer is) and just time out.
-# Rather than touch any system network/routing settings, run a tiny local TCP
-# proxy whose outbound socket is explicitly bound to en6's address, and point
-# ffmpeg/ffprobe at that local proxy instead of the camera directly.
-SOURCE_IP = "192.168.1.50"  # en6 (direct-cable adapter)
-PROXY_PORT = 15540
+
+def resource_path(name):
+    """Model/data file: prefer one shipped next to the app (user-supplied), else the baked-in bundle copy."""
+    p = os.path.join(BASE, name)
+    return p if os.path.exists(p) else os.path.join(BUNDLE, name)
+
+
+# config.json (optional, next to the app) overrides these defaults so the same build runs on any
+# machine/network without editing source. See config.example.json. Camera credentials still live in
+# the separate .camera_user/.camera_pw files (kept out of config so they're easy to gitignore).
+_CFG = {}
+_cfg_path = os.path.join(BASE, "config.json")
+if os.path.exists(_cfg_path):
+    try:
+        with open(_cfg_path) as _f:
+            _CFG = json.load(_f)
+    except Exception as _e:
+        print(f"[config] could not read config.json ({_e}); using defaults", flush=True)
+
+CAMERA_IP = _CFG.get("camera_ip", "192.168.1.3")
+HTTP_PORT = int(_CFG.get("http_port", 5055))
+
+# The RTSP proxy is a Mac-specific workaround: this Mac's Wi-Fi (en0) and the direct-cabled camera
+# adapter (en6) both use 192.168.1.x, so routing to CAMERA_IP is ambiguous and can time out. The proxy
+# binds its outbound socket to en6's address to force the right path. On a normal single-network machine
+# (e.g. the Windows box) this isn't needed -- set "use_proxy": false in config.json to connect directly.
+USE_RTSP_PROXY = bool(_CFG.get("use_proxy", True))
+SOURCE_IP = _CFG.get("source_ip", "192.168.1.50")  # en6 (direct-cable adapter); only used with the proxy
+PROXY_PORT = int(_CFG.get("proxy_port", 15540))
 
 
 def _relay(src, dst):
@@ -79,8 +109,12 @@ def start_rtsp_proxy():
         _handle_proxy_client(client)
 
 
-threading.Thread(target=start_rtsp_proxy, daemon=True).start()
-time.sleep(0.3)  # let the proxy's listen socket come up before ffprobe/ffmpeg try it
+if USE_RTSP_PROXY:
+    threading.Thread(target=start_rtsp_proxy, daemon=True).start()
+    time.sleep(0.3)  # let the proxy's listen socket come up before ffprobe/ffmpeg try it
+    _RTSP_HOST = f"127.0.0.1:{PROXY_PORT}"
+else:
+    _RTSP_HOST = f"{CAMERA_IP}:554"  # direct connect -- normal single-network machines
 
 
 def _read_secret(fname, default):
@@ -92,19 +126,18 @@ CAMERA_USER = _read_secret(".camera_user", "admin")
 CAMERA_PASS = _read_secret(".camera_pw", "admin")
 
 # confirmed working via ffprobe on this camera (DH-IPC-HDBW3241RP-ZAS):
-# main: 2304x1296@20fps, sub: 704x576@20fps -- back to sub for speed: main was ~1.1-1.5fps detection
-# ceiling (no GPU), sub runs ~4x faster. The detector-confidence/size-gate fixes since then should
-# keep recognition working fine at the lower resolution.
-# routed through the local proxy (127.0.0.1:PROXY_PORT), not CAMERA_IP directly -- see above
+# main: 2304x1296@20fps, sub: 704x576@20fps -- sub used for speed (main ~1.1-1.5fps, sub ~4-5fps, no GPU).
+# _RTSP_HOST is the proxy (127.0.0.1) or the camera directly, depending on config (see above). The Dahua
+# path below is the common one; other vendors (Hikvision etc.) use different paths added at discovery time.
 RTSP_CANDIDATES = [
-    f"rtsp://{CAMERA_USER}:{CAMERA_PASS}@127.0.0.1:{PROXY_PORT}/cam/realmonitor?channel=1&subtype=1",  # sub stream (preferred)
-    f"rtsp://{CAMERA_USER}:{CAMERA_PASS}@127.0.0.1:{PROXY_PORT}/cam/realmonitor?channel=1&subtype=0",  # main stream (fallback)
+    f"rtsp://{CAMERA_USER}:{CAMERA_PASS}@{_RTSP_HOST}/cam/realmonitor?channel=1&subtype=1",  # sub stream (preferred)
+    f"rtsp://{CAMERA_USER}:{CAMERA_PASS}@{_RTSP_HOST}/cam/realmonitor?channel=1&subtype=0",  # main stream (fallback)
 ]
 DB_PATH = os.path.join(BASE, "events.db")
 SNAP_DIR = os.path.join(BASE, "snapshots")
 KNOWN_DIR = os.path.join(BASE, "known_faces")  # legacy: subfolder per person, imported into the DB once
-YUNET_MODEL = os.path.join(BASE, "yunet.onnx")
-SFACE_MODEL = os.path.join(BASE, "sface.onnx")
+YUNET_MODEL = resource_path("yunet.onnx")
+SFACE_MODEL = resource_path("sface.onnx")
 MATCH_THRESHOLD = 0.38    # SFace's textbook default is 0.363. Was loosened to 0.30 to stop known faces
                           # flagging "unknown" -- but matching takes the BEST score across every stored
                           # reference photo per person, and Vansh alone has 28 of them (auto-enriched
@@ -395,7 +428,7 @@ def attendance_for_date(date=None):
 # ---- models -----------------------------------------------------------------
 print("[init] loading YOLO...", flush=True)
 from ultralytics import YOLO
-yolo = YOLO(os.path.join(BASE, "yolov8n.pt"))  # official Ultralytics weights, already downloaded
+yolo = YOLO(resource_path("yolov8n.pt"))  # official Ultralytics weights (shipped next to app or in bundle)
 PERSON_CLASS_ID = [k for k, v in yolo.names.items() if v == "person"][0]
 
 print("[init] loading YuNet + SFace...", flush=True)
@@ -525,8 +558,23 @@ def match_identity(embedding):
 # This opencv-python wheel was built with no FFmpeg support (avcodec/avformat: NO),
 # so cv2.VideoCapture can never open RTSP here. Pipe raw frames from the real
 # system ffmpeg binary instead -- same transport that ffprobe already proved works.
-FFMPEG_BIN = "/opt/miniconda3/bin/ffmpeg"
-FFPROBE_BIN = "/opt/miniconda3/bin/ffprobe"
+# Resolution order: config.json override -> a copy shipped next to the app (Windows: ffmpeg.exe in
+# an "ffmpeg" subfolder) -> the system one on PATH. Keeps the Mac dev path and the Windows exe both working.
+def _resolve_bin(name, cfg_key):
+    override = _CFG.get(cfg_key)
+    if override and os.path.exists(override):
+        return override
+    exe = name + (".exe" if os.name == "nt" else "")
+    for cand in (os.path.join(BASE, exe), os.path.join(BASE, "ffmpeg", exe),
+                 "/opt/miniconda3/bin/" + name):
+        if os.path.exists(cand):
+            return cand
+    return shutil.which(name) or exe  # fall back to PATH; bare name lets ffmpeg errors surface clearly
+
+
+FFMPEG_BIN = _resolve_bin("ffmpeg", "ffmpeg_path")
+FFPROBE_BIN = _resolve_bin("ffprobe", "ffprobe_path")
+print(f"[init] ffmpeg: {FFMPEG_BIN}", flush=True)
 
 
 def probe_size(url):
@@ -840,6 +888,11 @@ class CameraStream:
         self._expire_pending(now)  # runs every cycle, even with zero faces this frame -- so someone
                                     # who has walked out of view gets marked "gone" promptly
 
+        # RECORDING GATE: recognition + live overlay run all day, but NOTHING is written to disk/DB
+        # outside a configured attendance window -- no event rows, no snapshot files, no enrichment.
+        # rec_phase is "morning"/"evening" when a window is open, else None. Computed once per frame.
+        rec_phase = current_attendance_phase()
+
         for f in (faces if faces is not None else []):
             x, y, fw, fh = f[:4].astype(int)
 
@@ -859,11 +912,16 @@ class CameraStream:
             else:
                 display_label = f"{name} — {company}" if company else name
                 log_name = name
-                enrich_person(person_id, embedding, now)  # bank this sample -> hardens against
-                                                            # lighting changes (B&W/IR vs color) over time
+                if rec_phase:
+                    enrich_person(person_id, embedding, now)  # bank a sample -> hardens against lighting
+                                                               # changes; only while recording is active
 
             dets.append({"type": "face", "kind": kind, "box": [int(x), int(y), int(fw), int(fh)],
                          "label": display_label})
+
+            # everything below writes to disk/DB -- skip entirely unless an attendance window is open
+            if not rec_phase:
+                continue
 
             cooldown_key = person_id if person_id is not None else log_name
             if now - last_seen_at.get(cooldown_key, 0) > RELOG_COOLDOWN_SEC:
@@ -875,13 +933,10 @@ class CameraStream:
                     cv2.imwrite(os.path.join(SNAP_DIR, snap_name), crop)
                 log_event(log_name, kind, snap_name, person_id=person_id, location=location)
 
-                # attendance: known people only, only while a configured window is open. Runs inside
-                # this throttled block so it writes at most once/RELOG_COOLDOWN per person -- fine since
-                # check_in is set-once and check_out just tracks the latest sighting to within that gap.
+                # attendance: known people only. check_in is set-once (morning), check_out tracks the
+                # latest evening sighting -- so a person seen many times is recorded once per window.
                 if person_id is not None:
-                    phase = current_attendance_phase()
-                    if phase:
-                        mark_attendance(person_id, name, snap_name, phase, datetime.now())
+                    mark_attendance(person_id, name, snap_name, rec_phase, datetime.now())
 
         with self.lock:
             self.detections = dets
@@ -1475,5 +1530,5 @@ def database_page():
 
 
 if __name__ == "__main__":
-    print(f"[web] open http://localhost:5055", flush=True)
-    app.run(host="0.0.0.0", port=5055, threaded=True)
+    print(f"[web] open http://localhost:{HTTP_PORT}", flush=True)
+    app.run(host="0.0.0.0", port=HTTP_PORT, threaded=True)

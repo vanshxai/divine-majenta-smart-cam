@@ -1,0 +1,10 @@
+{
+  "_comment": "Copy this file to config.json (same folder as the app) and edit. Credentials are NOT here -- put the camera username in .camera_user and password in .camera_pw (plain text, one line each).",
+  "camera_ip": "192.168.0.10",
+  "use_proxy": false,
+  "http_port": 5055,
+  "_use_proxy_help": "Leave use_proxy false on a normal single-network PC. It is only a Mac dev workaround for a dual-subnet routing clash.",
+  "_ffmpeg_help": "ffmpeg is required. Put ffmpeg.exe and ffprobe.exe in a folder named 'ffmpeg' next to the app, OR on the system PATH, OR set ffmpeg_path / ffprobe_path below to full paths.",
+  "ffmpeg_path": "",
+  "ffprobe_path": ""
+}
