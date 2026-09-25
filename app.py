@@ -14,7 +14,6 @@ View: http://localhost:5055
 import os
 import cv2
 import json
-import math
 import time
 import uuid
 import socket
@@ -22,7 +21,6 @@ import sqlite3
 import threading
 import subprocess
 import numpy as np
-import mediapipe as mp
 from datetime import datetime
 from flask import Flask, Response, jsonify, request, send_from_directory
 
@@ -232,11 +230,31 @@ def init_db():
         snapshot TEXT,
         location TEXT
     )""")
+    # attendance: one row per person per day. check_in is set once (first sighting in the morning
+    # window); check_out tracks the latest sighting in the evening window. UNIQUE(person_id, date)
+    # is what enforces "log each person only once per day" no matter how often they're seen.
+    con.execute("""CREATE TABLE IF NOT EXISTS attendance (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        person_id INTEGER REFERENCES people(id),
+        name TEXT,
+        date TEXT NOT NULL,           -- YYYY-MM-DD (local)
+        check_in TEXT,                -- ISO time, first seen in the morning window
+        check_out TEXT,               -- ISO time, last seen in the evening window
+        check_in_snapshot TEXT,
+        check_out_snapshot TEXT,
+        UNIQUE(person_id, date)
+    )""")
     con.commit()
     if get_setting(con, "default_company") is None:
         set_setting(con, "default_company", DEFAULT_COMPANY)
     if get_setting(con, "location") is None:
         set_setting(con, "location", "")
+    # attendance window defaults (editable in the UI). Times are local "HH:MM", 24-hour.
+    for key, default in (("att_enabled", "1"),
+                          ("att_morning_start", "08:45"), ("att_morning_end", "09:15"),
+                          ("att_evening_start", "16:45"), ("att_evening_end", "17:15")):
+        if get_setting(con, key) is None:
+            set_setting(con, key, default)
     con.close()
 
 
@@ -303,6 +321,77 @@ def recent_events(limit=2000):
             for r in rows]
 
 
+# ---- attendance -------------------------------------------------------------
+def get_attendance_config(con=None):
+    own = con is None
+    if own:
+        con = db()
+    cfg = {
+        "enabled": get_setting(con, "att_enabled", "1") == "1",
+        "morning_start": get_setting(con, "att_morning_start", "08:45"),
+        "morning_end": get_setting(con, "att_morning_end", "09:15"),
+        "evening_start": get_setting(con, "att_evening_start", "16:45"),
+        "evening_end": get_setting(con, "att_evening_end", "17:15"),
+    }
+    if own:
+        con.close()
+    return cfg
+
+
+def current_attendance_phase(cfg=None, now=None):
+    """Returns 'morning', 'evening', or None depending on whether the current local time falls
+    inside a configured window. Comparison is on "HH:MM" strings, which sort correctly for a
+    same-day 24h clock."""
+    if cfg is None:
+        cfg = get_attendance_config()
+    if not cfg["enabled"]:
+        return None
+    hm = (now or datetime.now()).strftime("%H:%M")
+    if cfg["morning_start"] <= hm <= cfg["morning_end"]:
+        return "morning"
+    if cfg["evening_start"] <= hm <= cfg["evening_end"]:
+        return "evening"
+    return None
+
+
+def mark_attendance(person_id, name, snapshot, phase, now):
+    """Record attendance for a recognized known person, gated to the active window.
+    Morning -> set check_in once (first sighting). Evening -> keep check_out at the latest sighting.
+    UNIQUE(person_id, date) means a person is only ever one row per day no matter how often seen."""
+    if person_id is None or phase is None:
+        return
+    date = now.strftime("%Y-%m-%d")
+    ts = now.isoformat(timespec="seconds")
+    con = db()
+    con.execute("""INSERT OR IGNORE INTO attendance (person_id, name, date) VALUES (?,?,?)""",
+                (person_id, name, date))
+    if phase == "morning":
+        # only fills check_in if it's still empty -- so the FIRST morning sighting wins, later ones ignored
+        con.execute("""UPDATE attendance SET check_in=?, check_in_snapshot=?, name=?
+                       WHERE person_id=? AND date=? AND check_in IS NULL""",
+                    (ts, snapshot, name, person_id, date))
+    else:  # evening -> always advance check_out to the most recent sighting (when they left)
+        con.execute("""UPDATE attendance SET check_out=?, check_out_snapshot=?, name=?
+                       WHERE person_id=? AND date=?""",
+                    (ts, snapshot, name, person_id, date))
+    con.commit()
+    con.close()
+
+
+def attendance_for_date(date=None):
+    date = date or datetime.now().strftime("%Y-%m-%d")
+    con = db()
+    rows = con.execute("""SELECT a.name, c.name, a.check_in, a.check_out,
+                                 a.check_in_snapshot, a.check_out_snapshot
+                          FROM attendance a
+                          LEFT JOIN people p ON p.id = a.person_id
+                          LEFT JOIN companies c ON c.id = p.company_id
+                          WHERE a.date=? ORDER BY a.check_in IS NULL, a.check_in""", (date,)).fetchall()
+    con.close()
+    return [{"name": r[0], "company": r[1], "check_in": r[2], "check_out": r[3],
+             "check_in_snapshot": r[4], "check_out_snapshot": r[5]} for r in rows]
+
+
 # ---- models -----------------------------------------------------------------
 print("[init] loading YOLO...", flush=True)
 from ultralytics import YOLO
@@ -321,41 +410,6 @@ face_recognizer = cv2.FaceRecognizerSF.create(SFACE_MODEL, "")
 def embed_face(bgr_frame, face_box_5pt):
     aligned = face_recognizer.alignCrop(bgr_frame, face_box_5pt)
     return face_recognizer.feature(aligned)
-
-
-print("[init] loading MediaPipe Hands + FaceMesh...", flush=True)
-mp_hands = mp.solutions.hands.Hands(static_image_mode=False, max_num_hands=2,
-                                     min_detection_confidence=0.5, min_tracking_confidence=0.5)
-mp_facemesh = mp.solutions.face_mesh.FaceMesh(static_image_mode=False, max_num_faces=2,
-                                               min_detection_confidence=0.5, min_tracking_confidence=0.5)
-
-print("[init] loading YOLO-pose...", flush=True)
-pose_model = YOLO(os.path.join(BASE, "yolov8n-pose.pt"))  # official Ultralytics weights, auto-downloaded
-
-FINGER_TIP = [4, 8, 12, 16, 20]
-FINGER_PIP = [3, 6, 10, 14, 18]
-FINGER_NAME = ["Thumb", "Index", "Middle", "Ring", "Pinky"]
-EYE_L = [362, 385, 387, 263, 373, 380]
-EYE_R = [33, 160, 158, 133, 153, 144]
-EAR_CLOSED_THRESHOLD = 0.20
-
-
-def count_fingers(hand_landmarks, handedness_label):
-    lm = hand_landmarks.landmark
-    up = [lm[4].x < lm[3].x if handedness_label == "Right" else lm[4].x > lm[3].x]
-    for tip, pip in zip(FINGER_TIP[1:], FINGER_PIP[1:]):
-        up.append(lm[tip].y < lm[pip].y)  # tip above its pip joint (smaller y = higher in image) -> extended
-    names = [FINGER_NAME[i] for i, v in enumerate(up) if v]
-    return sum(up), names
-
-
-def _dist(a, b):
-    return math.hypot(a[0] - b[0], a[1] - b[1])
-
-
-def eye_aspect_ratio(landmarks, idxs, w, h):
-    p = [(landmarks[i].x * w, landmarks[i].y * h) for i in idxs]
-    return (_dist(p[1], p[5]) + _dist(p[2], p[4])) / (2 * _dist(p[0], p[3]) + 1e-6)
 
 
 def cosine(a, b):
@@ -502,9 +556,6 @@ class CameraStream:
         self.running = True
         self.status = "connecting"
         self.rotate_180 = ROTATE_180  # runtime-toggleable via the UI button / POST /rotate
-        self.advanced_detection = False  # hands/fingers/eyes/pose -- off by default (slow + less accurate
-                                          # right now); person detection + face recognition always run
-                                          # regardless of this flag. Toggle via the UI button / POST /advanced
         self.pending = {}         # pending_id -> {embeddings, crop, first_seen, last_seen, label, acknowledged}
         self.skip_cooldown = []   # [(embedding, ts), ...] recently-dismissed faces, don't re-prompt yet
         self.recently_dismissed = []  # acknowledged pending entries that expired -- kept briefly so a
@@ -824,36 +875,13 @@ class CameraStream:
                     cv2.imwrite(os.path.join(SNAP_DIR, snap_name), crop)
                 log_event(log_name, kind, snap_name, person_id=person_id, location=location)
 
-        # 3/4/5. hands, eyes, pose -- "advanced" extras, off by default: slower and less accurate right
-        # now, and person detection + face recognition above always run regardless of this flag.
-        if self.advanced_detection:
-            rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-
-            hand_results = mp_hands.process(rgb)
-            if hand_results.multi_hand_landmarks:
-                for hand_lm, handedness in zip(hand_results.multi_hand_landmarks, hand_results.multi_handedness):
-                    count, names = count_fingers(hand_lm, handedness.classification[0].label)
-                    xs = [p.x * w for p in hand_lm.landmark]
-                    ys = [p.y * h for p in hand_lm.landmark]
-                    x1, y1, x2, y2 = int(min(xs)), int(min(ys)), int(max(xs)), int(max(ys))
-                    label = f"{count} finger{'s' if count != 1 else ''}" + (f" ({', '.join(names)})" if names else "")
-                    dets.append({"type": "hand", "box": [x1, y1, x2 - x1, y2 - y1], "label": label})
-
-            mesh_results = mp_facemesh.process(rgb)
-            if mesh_results.multi_face_landmarks:
-                for face_lm in mesh_results.multi_face_landmarks:
-                    lms = face_lm.landmark
-                    ear = (eye_aspect_ratio(lms, EYE_L, w, h) + eye_aspect_ratio(lms, EYE_R, w, h)) / 2
-                    xs = [p.x * w for p in lms]
-                    ys = [p.y * h for p in lms]
-                    dets.append({"type": "gesture", "box": [int(min(xs)), int(min(ys)), 1, 1],
-                                 "label": "Eyes closed" if ear < EAR_CLOSED_THRESHOLD else "Eyes open",
-                                 "point_only": True})
-
-            pose_results = pose_model.predict(frame, verbose=False, conf=0.5)
-            for box in pose_results[0].boxes.xyxy.cpu().numpy():
-                x1, y1, x2, y2 = box.astype(int)
-                dets.append({"type": "pose", "box": [int(x1), int(y1), int(x2 - x1), int(y2 - y1)], "label": "pose"})
+                # attendance: known people only, only while a configured window is open. Runs inside
+                # this throttled block so it writes at most once/RELOG_COOLDOWN per person -- fine since
+                # check_in is set-once and check_out just tracks the latest sighting to within that gap.
+                if person_id is not None:
+                    phase = current_attendance_phase()
+                    if phase:
+                        mark_attendance(person_id, name, snap_name, phase, datetime.now())
 
         with self.lock:
             self.detections = dets
@@ -902,9 +930,11 @@ body{background:#111;color:#eee;font-family:sans-serif;margin:0;display:flex}
 #stage canvas{pointer-events:none}
 #fps{position:absolute;top:6px;left:6px;font-size:12px;color:#0f0;background:#0008;padding:2px 6px;border-radius:3px}
 #rotateBtn{position:absolute;top:6px;right:6px;z-index:2}
-#advBtn{position:absolute;top:6px;right:150px;z-index:2}
-#dbBtn{position:absolute;top:6px;right:330px;z-index:2;text-decoration:none;display:inline-block}
-#advBtn.on{background:#2e7d32;border-color:#2e7d32}
+#attBtn{position:absolute;top:6px;right:150px;z-index:2}
+#dbBtn{position:absolute;top:6px;right:300px;z-index:2;text-decoration:none;display:inline-block}
+#attPill{position:absolute;top:8px;left:70px;z-index:2;font-size:13px;font-weight:bold;
+         padding:4px 10px;border-radius:12px;background:#333;color:#aaa}
+#attPill.open{background:#2e7d32;color:#fff}
 #locbar{display:flex;gap:6px}
 #locbar input{flex:1;background:#222;border:1px solid #444;color:#eee;padding:5px;border-radius:4px}
 button{background:#333;border:1px solid #555;color:#eee;padding:5px 10px;border-radius:4px;cursor:pointer}
@@ -922,15 +952,28 @@ button:hover{background:#444}
 #card .btns{display:flex;gap:8px;margin-top:12px}
 #card .btns button{flex:1}
 #card .primary{background:#2e7d32;border-color:#2e7d32}
+#attModal{position:fixed;inset:0;background:#000c;display:none;align-items:center;justify-content:center;z-index:10}
+#attCard{background:#1a1a1a;border:1px solid #444;border-radius:10px;padding:22px;width:380px}
+#attCard .attRow{display:flex;align-items:center;gap:8px;font-size:14px;margin-bottom:12px}
+#attCard .attGrid{display:grid;grid-template-columns:1fr auto 1fr auto;gap:8px;align-items:center;font-size:13px;color:#bbb}
+#attCard input[type=time]{background:#222;border:1px solid #444;color:#eee;padding:5px;border-radius:4px}
+#attCard .btns{display:flex;gap:8px;margin-top:14px}
+#attCard .btns button{flex:1}
+#attCard .primary{background:#2e7d32;border-color:#2e7d32}
+.attItem{display:flex;justify-content:space-between;font-size:13px;padding:6px 4px;border-bottom:1px solid #222}
+.attItem .nm{font-weight:bold;color:#eee}
+.attItem .tm{color:#9c9;font-variant-numeric:tabular-nums}
+.attItem .out{color:#c99}
 </style></head>
 <body>
 <div id="stage">
   <img id="vid" src="/raw_feed">
   <canvas id="overlay"></canvas>
   <div id="fps"></div>
+  <div id="attPill">Attendance: —</div>
   <a id="dbBtn" href="/database" target="_blank"><button>🗄 Database</button></a>
   <button id="rotateBtn" onclick="toggleRotate()">⟳ Rotate 180°</button>
-  <button id="advBtn" onclick="toggleAdvanced()">Advanced detection: OFF</button>
+  <button id="attBtn" onclick="openAttendance()">🕐 Attendance</button>
 </div>
 <div id="log">
   <div class="locSection">
@@ -959,10 +1002,24 @@ button:hover{background:#444}
   </div>
 </div></div>
 
+<div id="attModal"><div id="attCard">
+  <div style="font-size:16px;font-weight:bold;margin-bottom:12px">🕐 Attendance</div>
+  <label class="attRow"><input type="checkbox" id="attEnabled"> Attendance recording on</label>
+  <div class="attGrid">
+    <div>Morning in — from</div><input type="time" id="mStart">
+    <div>to</div><input type="time" id="mEnd">
+    <div>Evening out — from</div><input type="time" id="eStart">
+    <div>to</div><input type="time" id="eEnd">
+  </div>
+  <div style="font-size:12px;color:#888;margin:6px 0 12px">Faces are only recorded for attendance during these windows. Each person is logged once (check-in) in the morning and their last exit (check-out) in the evening.</div>
+  <div class="btns"><button onclick="closeAtt()">Close</button><button class="primary" onclick="saveAtt()">Save</button></div>
+  <div style="font-weight:bold;margin:16px 0 6px">Today</div>
+  <div id="attToday" class="scrollbox" style="max-height:220px"></div>
+</div></div>
+
 <script>
 const vid = document.getElementById('vid'), cv = document.getElementById('overlay'), ctx = cv.getContext('2d');
-const colors = {person: '#ff8c00', known: '#4caf50', unknown: '#e53935',
-                 hand: '#00bcd4', gesture: '#ffeb3b', pose: '#9c27b0'};
+const colors = {person: '#ff8c00', known: '#4caf50', unknown: '#e53935'};
 
 function resizeCanvas(){
   const r = vid.getBoundingClientRect();
@@ -1032,21 +1089,6 @@ async function toggleRotate(){
   await fetch('/rotate', {method:'POST'});
 }
 
-// ---- advanced detection toggle (hands/fingers/eyes/pose) ----
-function renderAdvBtn(on){
-  const b = document.getElementById('advBtn');
-  b.textContent = 'Advanced detection: ' + (on ? 'ON' : 'OFF');
-  b.classList.toggle('on', on);
-}
-async function toggleAdvanced(){
-  const r = await fetch('/advanced', {method:'POST'}); const s = await r.json();
-  renderAdvBtn(s.advanced_detection);
-}
-(async () => {
-  const r = await fetch('/advanced'); const s = await r.json();
-  renderAdvBtn(s.advanced_detection);
-})();
-
 // ---- unknown-face list (sidebar, passive -- never pops up on its own) ----
 let currentPendingId = null;
 async function pollPending(){
@@ -1092,6 +1134,50 @@ async function assignPending(){
   await fetch('/assign', {method:'POST', headers:{'Content-Type':'application/json'},
     body: JSON.stringify({pending_id: currentPendingId, name, company})});
   closeModal();
+}
+
+// ---- attendance ----
+const PHASE_LABEL = {morning: 'CHECK-IN OPEN', evening: 'CHECK-OUT OPEN'};
+async function pollAttStatus(){
+  try {
+    const r = await fetch('/attendance_status'); const s = await r.json();
+    const pill = document.getElementById('attPill');
+    if (!s.enabled) { pill.textContent = 'Attendance: off'; pill.classList.remove('open'); }
+    else if (s.open) { pill.textContent = PHASE_LABEL[s.phase]; pill.classList.add('open'); }
+    else { pill.textContent = 'Attendance: waiting'; pill.classList.remove('open'); }
+  } catch (e) {}
+  setTimeout(pollAttStatus, 5000);
+}
+pollAttStatus();
+
+function fmtTime(iso){ return iso ? iso.slice(11,16) : '—'; }
+async function openAttendance(){
+  const c = await (await fetch('/attendance_config')).json();
+  document.getElementById('attEnabled').checked = c.enabled;
+  document.getElementById('mStart').value = c.morning_start;
+  document.getElementById('mEnd').value = c.morning_end;
+  document.getElementById('eStart').value = c.evening_start;
+  document.getElementById('eEnd').value = c.evening_end;
+  const list = await (await fetch('/attendance')).json();
+  document.getElementById('attToday').innerHTML = list.length === 0
+    ? '<div style="color:#666;font-size:13px;padding:8px">No one recorded yet today</div>'
+    : list.map(a => `<div class="attItem"><span class="nm">${a.name || '—'}</span>
+        <span><span class="tm">in ${fmtTime(a.check_in)}</span> &nbsp; <span class="tm out">out ${fmtTime(a.check_out)}</span></span></div>`).join('');
+  document.getElementById('attModal').style.display = 'flex';
+}
+function closeAtt(){ document.getElementById('attModal').style.display = 'none'; }
+async function saveAtt(){
+  const body = {
+    enabled: document.getElementById('attEnabled').checked,
+    morning_start: document.getElementById('mStart').value,
+    morning_end: document.getElementById('mEnd').value,
+    evening_start: document.getElementById('eStart').value,
+    evening_end: document.getElementById('eEnd').value,
+  };
+  await fetch('/attendance_config', {method:'POST', headers:{'Content-Type':'application/json'},
+    body: JSON.stringify(body)});
+  closeAtt();
+  pollAttStatus();
 }
 </script></body></html>"""
 
@@ -1206,11 +1292,45 @@ def rotate():
     return jsonify({"rotate_180": camera.rotate_180})
 
 
-@app.route("/advanced", methods=["GET", "POST"])
-def advanced():
+@app.route("/attendance")
+def attendance():
+    date = request.args.get("date")  # YYYY-MM-DD, defaults to today
+    return jsonify(attendance_for_date(date))
+
+
+@app.route("/attendance_status")
+def attendance_status():
+    cfg = get_attendance_config()
+    phase = current_attendance_phase(cfg)
+    return jsonify({"enabled": cfg["enabled"], "phase": phase, "open": phase is not None,
+                    "now": datetime.now().strftime("%H:%M")})
+
+
+@app.route("/attendance_config", methods=["GET", "POST"])
+def attendance_config():
+    con = db()
     if request.method == "POST":
-        camera.advanced_detection = not camera.advanced_detection
-    return jsonify({"advanced_detection": camera.advanced_detection})
+        body = request.get_json(force=True)
+        set_setting(con, "att_enabled", "1" if body.get("enabled") else "0")
+        for field, key in (("morning_start", "att_morning_start"), ("morning_end", "att_morning_end"),
+                           ("evening_start", "att_evening_start"), ("evening_end", "att_evening_end")):
+            val = (body.get(field) or "").strip()
+            if _valid_hhmm(val):
+                set_setting(con, key, val)
+    cfg = get_attendance_config(con)
+    con.close()
+    return jsonify(cfg)
+
+
+def _valid_hhmm(s):
+    """Guard against bad time input silently corrupting a window (which would disable attendance)."""
+    if not s or len(s) != 5 or s[2] != ":":
+        return False
+    try:
+        hh, mm = int(s[:2]), int(s[3:])
+    except ValueError:
+        return False
+    return 0 <= hh <= 23 and 0 <= mm <= 59
 
 
 @app.route("/db_data")
@@ -1232,10 +1352,12 @@ def db_data():
                                    LEFT JOIN people pe ON pe.id = se.person_id
                                    ORDER BY se.id DESC LIMIT 200""").fetchall()
     con.close()
+    today_attendance = attendance_for_date()
     unknown_snaps = sorted(
         (f for f in os.listdir(SNAP_DIR) if f.lower().startswith("unknown")),
         reverse=True)[:200]
     return jsonify({
+        "attendance_today": today_attendance,
         "companies": [{"id": r[0], "name": r[1], "created_at": r[2], "people_count": r[3]} for r in companies],
         "people": [{"id": r[0], "name": r[1], "company": r[2], "created_at": r[3], "embeddings": r[4]}
                    for r in people_rows],
@@ -1274,6 +1396,9 @@ th{color:#999;font-weight:normal}
 <h1>Database explorer</h1>
 <div id="summary"></div>
 
+<h2>Today's attendance</h2>
+<div id="attendanceToday" class="scrollbox"></div>
+
 <h2>Companies</h2>
 <div id="companies" class="scrollbox"></div>
 
@@ -1299,7 +1424,17 @@ async function load(){
     `<span class="badge">${d.total_events} total events</span>` +
     `<span class="badge">${d.event_counts.known || 0} known sightings</span>` +
     `<span class="badge">${d.event_counts.unknown || 0} unknown sightings</span>` +
-    `<span class="badge">${d.unknown_snapshot_count} unknown photos stored</span>`;
+    `<span class="badge">${d.unknown_snapshot_count} unknown photos stored</span>` +
+    `<span class="badge">${d.attendance_today.length} present today</span>`;
+
+  const att = d.attendance_today;
+  document.getElementById('attendanceToday').innerHTML = att.length === 0
+    ? '<div class="empty">no one recorded yet today</div>'
+    : '<table><tr><th>Name</th><th>Company</th><th>Check-in</th><th>Check-out</th></tr>' +
+      att.map(a => `<tr><td>${a.name || '—'}</td><td>${a.company || '—'}</td>` +
+        `<td>${a.check_in ? a.check_in.slice(11,16) : '—'}</td>` +
+        `<td>${a.check_out ? a.check_out.slice(11,16) : '—'}</td></tr>`).join('') +
+      '</table>';
 
   document.getElementById('companies').innerHTML = d.companies.length === 0
     ? '<div class="empty">none yet</div>'
